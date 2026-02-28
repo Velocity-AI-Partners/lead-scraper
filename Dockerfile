@@ -1,4 +1,4 @@
-FROM pyd4vinci/scrapling:latest
+FROM python:3.12-slim
 
 WORKDIR /service
 
@@ -9,5 +9,4 @@ COPY app/ app/
 
 EXPOSE 8000
 
-ENTRYPOINT []
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
