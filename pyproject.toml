@@ -11,6 +11,9 @@ dependencies = [
     "scrapling[fetchers]>=0.2.9",
 ]
 
+[tool.setuptools.packages.find]
+include = ["app*"]
+
 [build-system]
 requires = ["setuptools>=75.0"]
 build-backend = "setuptools.build_meta"
