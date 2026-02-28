@@ -1,7 +1,6 @@
 """
 WellnessLiving scraper (IMA Worcester).
 
-REST API behind Cloudflare: uses curl_cffi for TLS fingerprint impersonation.
 OAuth2 client_credentials -> bearer token -> paginated report/query (cid_report 689).
 
 API quirks discovered via testing:
@@ -15,7 +14,7 @@ API quirks discovered via testing:
 import logging
 from datetime import date
 
-from curl_cffi.requests import AsyncSession
+import httpx
 
 from app.config import settings
 from app.schemas import Lead, ScrapeResponse
@@ -26,6 +25,8 @@ log = logging.getLogger(__name__)
 TOKEN_URL = "https://access.api.wellnessliving.io/oauth2/token"
 API_BASE = "https://api.wellnessliving.io"
 PAGE_SIZE = 50
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 # Field index mapping (from a_field array, verified against live API)
 F_UID = "uid"
@@ -43,8 +44,8 @@ def _row_to_dict(row: list, fields: list[str]) -> dict:
     return {fields[i]: row[i] for i in range(min(len(row), len(fields)))}
 
 
-async def _get_token(session: AsyncSession) -> str:
-    resp = await session.post(
+async def _get_token(client: httpx.AsyncClient) -> str:
+    resp = await client.post(
         TOKEN_URL,
         data={
             "grant_type": "client_credentials",
@@ -56,11 +57,12 @@ async def _get_token(session: AsyncSession) -> str:
     return resp.json()["access_token"]
 
 
-async def _fetch_leads(session: AsyncSession, token: str) -> tuple[list[dict], list[str]]:
+async def _fetch_leads(client: httpx.AsyncClient, token: str) -> tuple[list[dict], list[str]]:
     """Paginate through report/query to get all prospects/leads."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
+        "User-Agent": UA,
     }
     params = {"id_region": 1, "k_business": settings.wl_business_id}
 
@@ -90,7 +92,7 @@ async def _fetch_leads(session: AsyncSession, token: str) -> tuple[list[dict], l
         }
 
         try:
-            resp = await session.post(
+            resp = await client.post(
                 f"{API_BASE}/v1/report/query",
                 params=params,
                 headers=headers,
@@ -130,9 +132,13 @@ async def scrape_wellnessliving() -> ScrapeResponse:
     leads: list[Lead] = []
     total_raw = 0
 
-    async with AsyncSession(impersonate="chrome") as session:
-        token = await _get_token(session)
-        all_rows, fetch_errors = await _fetch_leads(session, token)
+    async with httpx.AsyncClient(
+        headers={"User-Agent": UA},
+        follow_redirects=True,
+        timeout=30,
+    ) as client:
+        token = await _get_token(client)
+        all_rows, fetch_errors = await _fetch_leads(client, token)
         errors.extend(fetch_errors)
 
         # Deduplicate by uid
