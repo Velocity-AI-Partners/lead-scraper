@@ -3,10 +3,12 @@ ClubReady scraper (SZ Westborough).
 
 3-step cookie chain auth + A-Z brute-force QuickSearch.
 Filters to leads/prospects during scraping (skips members).
-Uses httpx with retry logic (QuickSearch returns JSON, no browser needed).
+Auth flow matches the working n8n Member_List_Scraper_Updated workflow exactly.
 """
 
 import asyncio
+import base64
+import json
 import logging
 import re
 import string
@@ -15,7 +17,7 @@ import httpx
 
 from app.config import settings
 from app.schemas import Lead, ScrapeResponse
-from app.utils.normalize import normalize_phone, normalize_name, days_since, is_lead_status
+from app.utils.normalize import normalize_phone, normalize_name, days_since
 
 log = logging.getLogger(__name__)
 
@@ -30,88 +32,131 @@ RETRY_DELAY = 1.0
 
 LEAD_STATUSES = {"lead", "prospect", "inquiry", "trial", "intro", "guest"}
 
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-async def _auth(client: httpx.AsyncClient) -> None:
-    """3-step ClubReady login to establish session cookies."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    # Step 1: POST to login.clubready.com
+def _decode_jwt_payload(token: str) -> dict:
+    """Decode the payload section of a JWT (no signature verification needed)."""
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    payload_b64 = parts[1]
+    # Add padding if needed
+    payload_b64 += "=" * (4 - len(payload_b64) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        return {}
+
+
+def _extract_cookies(resp: httpx.Response) -> dict[str, str]:
+    """Extract cookies from Set-Cookie headers."""
+    cookies: dict[str, str] = {}
+    raw = resp.headers.get_list("set-cookie")
+    for header in raw:
+        match = re.match(r"^([^=]+)=([^;]*)", header.strip())
+        if match:
+            cookies[match.group(1).strip()] = match.group(2)
+    return cookies
+
+
+async def _auth(client: httpx.AsyncClient) -> str:
+    """
+    3-step ClubReady login. Returns the merged cookie string for QuickSearch.
+
+    Step 1: POST login.clubready.com with username/pw/inst -> get JWT token
+    Step 2: POST loginselector with Token/StoreId -> get session cookies
+    Step 3: POST Security/Login with Token/UID + step2 cookies -> get final cookies
+    """
+    headers = {"User-Agent": UA}
+
+    # Step 1: Login to get JWT token
     resp = await client.post(
         LOGIN_URL,
-        data={"UserName": settings.cr_username, "Password": settings.cr_password},
+        data={"username": settings.cr_username, "pw": settings.cr_password, "inst": "1"},
         headers=headers,
-        follow_redirects=True,
+        follow_redirects=False,
         timeout=30,
     )
-    # Extract token from redirect URL or response
-    token = None
-    uid = None
+    # Follow redirect manually if needed
+    if resp.status_code in (301, 302, 303):
+        location = resp.headers.get("location", "")
+        if location:
+            resp = await client.get(location, headers=headers, follow_redirects=True, timeout=30)
 
-    # Token might be in the redirect URL params
-    url_str = str(resp.url)
-    token_match = re.search(r'[?&]token=([^&]+)', url_str)
-    if token_match:
-        token = token_match.group(1)
+    body = resp.text
 
-    # Or in hidden form fields
-    token_match = token_match or re.search(r'name="token"\s+value="([^"]+)"', resp.text)
-    if not token and token_match:
-        token = token_match.group(1)
+    # Extract token from response body
+    token_match = re.search(r'"Token"\s*:\s*"([^"]+)"', body)
+    if not token_match:
+        raise RuntimeError(f"ClubReady step 1: no Token in response. Status={resp.status_code}, body preview: {body[:300]}")
 
-    # Or in JSON response
-    if not token:
-        try:
-            data = resp.json()
-            token = data.get("token", data.get("Token"))
-            uid = data.get("uid", data.get("UID", data.get("userId")))
-        except Exception:
-            pass
+    token = token_match.group(1)
 
-    # Try extracting from the response body
-    if not token:
-        token_match = re.search(r'"[Tt]oken"\s*:\s*"([^"]+)"', resp.text)
-        if token_match:
-            token = token_match.group(1)
+    # Decode JWT to get UserId and StoreId
+    payload = _decode_jwt_payload(token)
+    user_id = str(payload.get("UserId", payload.get("userId", payload.get("sub", ""))))
 
-    if not token:
-        raise RuntimeError("ClubReady auth step 1 failed: no token in response")
+    # Auto-detect StoreId from JWT (field name varies: storeId, StoreId, Stores)
+    store_id = settings.cr_store_id
+    if not store_id:
+        if payload.get("storeId"):
+            store_id = str(payload["storeId"])
+        elif payload.get("StoreId"):
+            store_id = str(payload["StoreId"])
+        elif payload.get("Stores") and isinstance(payload["Stores"], list):
+            stores = payload["Stores"]
+            if len(stores) == 1:
+                store_id = str(stores[0].get("StoreId", stores[0].get("Id", "")))
+            else:
+                # Find Westborough
+                for s in stores:
+                    name = str(s.get("Name", s.get("StoreName", ""))).lower()
+                    if "westborough" in name:
+                        store_id = str(s.get("StoreId", s.get("Id", "")))
+                        break
+                if not store_id:
+                    store_id = str(stores[0].get("StoreId", stores[0].get("Id", "")))
 
-    # Extract UID if not found yet
-    if not uid:
-        uid_match = re.search(r'"(?:uid|UID|userId|UserId)"\s*:\s*"?(\d+)"?', resp.text)
-        if uid_match:
-            uid = uid_match.group(1)
+    if not store_id:
+        raise RuntimeError(f"ClubReady step 1: could not determine StoreId. JWT payload keys: {list(payload.keys())}")
 
-    log.info("ClubReady: step 1 complete, token=%s...", token[:20] if token else "None")
+    log.info("ClubReady: step 1 complete. UserId=%s, StoreId=%s, token=%s...", user_id, store_id, token[:20])
 
-    # Step 2: POST to loginselector with token + StoreId
+    # Step 2: POST to loginselector with Token + StoreId
     resp = await client.post(
         SELECTOR_URL,
-        data={"token": token, "StoreId": settings.cr_store_id},
+        data={"Token": token, "CoreTypeId": "1", "CoreId": "1", "StoreId": store_id},
         headers=headers,
-        follow_redirects=True,
+        follow_redirects=False,
         timeout=30,
     )
-    log.info("ClubReady: step 2 complete, status=%d", resp.status_code)
+    step2_cookies = _extract_cookies(resp)
+    step2_cookie_str = "; ".join(f"{k}={v}" for k, v in step2_cookies.items())
 
-    # Step 3: POST to Security/Login with token + UID
-    form_data = {"token": token}
-    if uid:
-        form_data["UID"] = uid
-    form_data["StoreId"] = settings.cr_store_id
+    log.info("ClubReady: step 2 complete. %d cookies from response", len(step2_cookies))
 
+    # Step 3: POST to Security/Login with Token + UID, passing step 2 cookies
+    step3_headers = {**headers, "Cookie": step2_cookie_str}
     resp = await client.post(
         SECURITY_URL,
-        data=form_data,
-        headers=headers,
-        follow_redirects=True,
+        data={"CoreTypeId": "1", "CoreId": "1", "Token": token, "UID": user_id},
+        headers=step3_headers,
+        follow_redirects=False,
         timeout=30,
     )
-    log.info("ClubReady: step 3 complete, cookies: %s", list(client.cookies.keys()))
+    step3_cookies = _extract_cookies(resp)
+
+    # Merge all cookies
+    all_cookies = {**step2_cookies, **step3_cookies}
+    cookie_str = "; ".join(f"{k}={v}" for k, v in all_cookies.items())
+
+    log.info("ClubReady: step 3 complete. %d total session cookies", len(all_cookies))
+    return cookie_str
 
 
 async def _quicksearch(
-    client: httpx.AsyncClient, prefix: str, retries: int = MAX_RETRIES
+    client: httpx.AsyncClient, prefix: str, cookies: str, retries: int = MAX_RETRIES
 ) -> list[dict]:
     """Run a single QuickSearch query with retry."""
     for attempt in range(retries):
@@ -119,7 +164,7 @@ async def _quicksearch(
             resp = await client.get(
                 QUICKSEARCH_URL,
                 params={"searchText": prefix, "searchType": "1"},
-                headers={"User-Agent": "Mozilla/5.0"},
+                headers={"User-Agent": UA, "Cookie": cookies},
                 timeout=15,
             )
             if resp.status_code == 200:
@@ -140,12 +185,9 @@ def _is_cr_lead(member: dict) -> bool:
     status_text = str(member.get("customerStatusText", "")).lower().strip()
     if status_text in LEAD_STATUSES:
         return True
-
-    # customerStatus == 3 is typically lead in ClubReady
     status_id = member.get("customerStatus")
     if status_id in (3, "3"):
         return True
-
     return False
 
 
@@ -165,29 +207,25 @@ async def scrape_clubready() -> ScrapeResponse:
     errors: list[str] = []
     lead_map: dict[int, dict] = {}
     queries = 0
+    capped: list[str] = []
     letters = string.ascii_lowercase
 
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-    ) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         try:
-            await _auth(client)
+            cookie_str = await _auth(client)
         except Exception as e:
             return ScrapeResponse(
                 leadCount=0, leads=[], errors=[f"Auth failed: {e}"], metadata={}
             )
 
-        # Pass 1: 3-letter prefixes (26 * 26 = 676 per first letter = 17,576 total)
-        capped: list[str] = []
-
+        # Pass 1: 3-letter prefixes (26^2 = 676 per first letter, 17,576 total)
         for c1 in letters:
             prefixes = [c1 + c2 + c3 for c2 in letters for c3 in letters]
 
             for i in range(0, len(prefixes), BATCH_SIZE):
                 batch = prefixes[i : i + BATCH_SIZE]
                 results = await asyncio.gather(
-                    *[_quicksearch(client, p) for p in batch]
+                    *[_quicksearch(client, p, cookie_str) for p in batch]
                 )
 
                 for j, result_list in enumerate(results):
@@ -213,7 +251,7 @@ async def scrape_clubready() -> ScrapeResponse:
             for i in range(0, len(drill_prefixes), BATCH_SIZE):
                 batch = drill_prefixes[i : i + BATCH_SIZE]
                 results = await asyncio.gather(
-                    *[_quicksearch(client, p) for p in batch]
+                    *[_quicksearch(client, p, cookie_str) for p in batch]
                 )
                 for result_list in results:
                     for member in result_list:
@@ -238,7 +276,7 @@ async def scrape_clubready() -> ScrapeResponse:
             last = member.get("lastName", "")
 
             # Handle combined name field
-            if not last and " " in first:
+            if not last and first and " " in first:
                 parts = first.split(None, 1)
                 first = parts[0]
                 last = parts[1] if len(parts) > 1 else ""
