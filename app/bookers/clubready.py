@@ -387,3 +387,68 @@ async def create_booking(req: BookingRequest, loc_config: dict) -> BookingRespon
             message=f"ClubReady booking error: {e}",
             errors=[str(e)],
         )
+
+
+async def get_member_info(
+    store_id: str, username: str, password: str, member_id: str
+) -> dict:
+    """
+    Fetch member profile + available credits from ClubReady.
+
+    Returns dict with: name, firstName, lastName, status, membershipType,
+    isMember, credits (count), creditDetails (list of credit names).
+    """
+    bearer = await _get_bearer_token(store_id, username, password)
+    headers = _api_headers(bearer)
+
+    result: dict = {
+        "name": None,
+        "firstName": None,
+        "lastName": None,
+        "status": None,
+        "membershipType": None,
+        "isMember": False,
+        "credits": None,
+        "creditDetails": [],
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        # 1. User profile
+        resp = await client.get(
+            f"{API_BASE}/users/v1/users/{member_id}",
+            params={"ReturnKeyNote": "true"},
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            d = resp.json()
+            result["firstName"] = d.get("FirstName")
+            result["lastName"] = d.get("LastName")
+            fn = (d.get("FirstName") or "")
+            ln = (d.get("LastName") or "")
+            result["name"] = f"{fn} {ln}".strip() or None
+            result["status"] = d.get("CustomerStatus")
+            result["membershipType"] = d.get("MembershipTypeName")
+            result["isMember"] = bool(d.get("Member"))
+        else:
+            log.warning("CR member-info user lookup failed: %d", resp.status_code)
+            return result
+
+        # 2. Available credits
+        resp = await client.get(
+            f"{API_BASE}/scheduling/v1/clubs/{store_id}/users/{member_id}/credits",
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            cd = resp.json()
+            result["credits"] = cd.get("totalRecords", 0)
+            result["creditDetails"] = [
+                c.get("name", "") for c in cd.get("data", [])
+            ]
+        else:
+            log.warning("CR member-info credits lookup failed: %d", resp.status_code)
+
+    log.info(
+        "CR member-info: %s (%s) credits=%s",
+        result["name"], result["status"], result["credits"],
+    )
+    return result

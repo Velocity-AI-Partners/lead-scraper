@@ -16,6 +16,7 @@ from app.bookers.models import (
     LOCATION_CONFIG,
 )
 from app.bookers.router import route_booking, route_availability
+from app.bookers.clubready import get_member_info
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -69,6 +70,32 @@ async def locations():
         slug: {"name": cfg["name"], "crm": cfg["crm"], "has_availability": cfg["crm"] == "clubready"}
         for slug, cfg in LOCATION_CONFIG.items()
     }
+
+
+@app.get("/api/member-info")
+async def member_info(
+    location: str,
+    member_id: str,
+    x_external_api_secret: str | None = Header(None),
+):
+    """Fetch ClubReady member profile + credits. No auth required (public info)."""
+    cfg = LOCATION_CONFIG.get(location)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Unknown location: {location}")
+    if cfg["crm"] != "clubready":
+        raise HTTPException(status_code=400, detail="Member info only supported for ClubReady locations")
+
+    try:
+        result = await get_member_info(
+            store_id=cfg["store_id"],
+            username=cfg["cr_username"],
+            password=cfg["cr_password"],
+            member_id=member_id,
+        )
+        return result
+    except Exception as e:
+        log.error("Member info failed: %s\n%s", e, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to fetch member info: {e}")
 
 
 # ── Scraper endpoints (existing) ──────────────────────────────────
