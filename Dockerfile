@@ -1,3 +1,4 @@
+# v2 - booking backend
 FROM python:3.12-slim
 
 WORKDIR /service
