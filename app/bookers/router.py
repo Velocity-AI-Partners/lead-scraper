@@ -41,6 +41,8 @@ async def _log_to_supabase(req: BookingRequest, resp: BookingResponse, loc_confi
         "instructor": req.instructor,
         "class_name": req.class_name,
         "source": req.source,
+        "member_id": req.member_id,
+        "lead_id": req.lead_id,
         "crm_booking_id": resp.booking_id,
         "crm_customer_id": resp.customer_id,
         "status": "confirmed" if resp.success else "failed",

@@ -102,14 +102,18 @@ async def create_booking(req: BookingRequest, loc_config: dict) -> BookingRespon
                 "k_business": settings.wl_business_id,
             }
 
-            # Step 1: Find user by email or phone
+            # Step 1: Resolve user ID (prefer direct member_id, fall back to search)
             uid = None
-            search_term = req.customer_email or req.customer_phone or req.customer_name
-            if search_term:
-                user = await find_user(c, token, search_term)
-                if user:
-                    uid = user.get("uid", user.get("k_user"))
-                    log.info("WL: found user uid=%s for '%s'", uid, search_term)
+            if req.member_id:
+                uid = req.member_id
+                log.info("WL: using provided member_id=%s as uid", uid)
+            else:
+                search_term = req.customer_email or req.customer_phone or req.customer_name
+                if search_term:
+                    user = await find_user(c, token, search_term)
+                    if user:
+                        uid = user.get("uid", user.get("k_user"))
+                        log.info("WL: found user uid=%s for '%s'", uid, search_term)
 
             # Step 2: Book appointment
             book_body = {

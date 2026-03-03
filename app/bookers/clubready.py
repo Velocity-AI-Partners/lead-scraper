@@ -272,15 +272,18 @@ async def create_booking(req: BookingRequest, loc_config: dict) -> BookingRespon
 
     headers = _api_headers(bearer)
 
-    # Step 1: Find customer by email or phone
-    customer = None
+    # Step 1: Resolve customer ID (prefer direct member_id, fall back to search)
     customer_id = None
-    search_term = req.customer_email or req.customer_phone or req.customer_name
-    if search_term:
-        customer = await find_customer(store_id, username, password, search_term)
-        if customer:
-            customer_id = str(customer.get("userId", customer.get("id", "")))
-            log.info("CR: found customer %s for '%s'", customer_id, search_term)
+    if req.member_id:
+        customer_id = req.member_id
+        log.info("CR: using provided member_id=%s", customer_id)
+    else:
+        search_term = req.customer_email or req.customer_phone or req.customer_name
+        if search_term:
+            customer = await find_customer(store_id, username, password, search_term)
+            if customer:
+                customer_id = str(customer.get("userId", customer.get("id", "")))
+                log.info("CR: found customer %s for '%s'", customer_id, search_term)
 
     # Step 2: Get schedule to find a slot matching the requested time
     schedule_data = []

@@ -16,6 +16,8 @@ class BookingRequest(BaseModel):
     requested_time: str  # "14:00" or "2:00 PM"
     instructor: str | None = None
     class_name: str | None = None
+    member_id: str | None = None   # CRM member/customer ID (e.g. ClubReady userId)
+    lead_id: str | None = None     # CRM lead ID
     source: str = "booking_page"  # "booking_page" or "nft_page"
     notes: str | None = None
 
